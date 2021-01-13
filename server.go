@@ -20,11 +20,15 @@ import (
 )
 
 const (
+	// Version of the gosshgit server
 	Version = "0.1.0"
 )
 
 var (
-	ErrServerClosed      = errors.New("gosshgit: server closed")
+	// ErrServerClosed signals the caller that the opration was requested
+	// to a closed server
+	ErrServerClosed = errors.New("gosshgit: server closed")
+
 	errInvalidGitCommand = errors.New("gosshgit: invalid git command")
 	errAccessDenied      = errors.New("gosshgit: access denied")
 )
@@ -111,7 +115,9 @@ func (srv *server) Initialize() error {
 func (srv *server) Shutdown(ctx context.Context) error {
 	srv.mu.Lock()
 	close(srv.doneChan)
-	srv.listener.Close()
+	if srv.listener != nil {
+		srv.listener.Close()
+	}
 	srv.mu.Unlock()
 
 	finished := make(chan struct{})
@@ -131,7 +137,9 @@ func (srv *server) Close() error {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	close(srv.doneChan)
-	srv.listener.Close()
+	if srv.listener != nil {
+		srv.listener.Close()
+	}
 	for c := range srv.connections {
 		c.Close()
 	}
