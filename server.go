@@ -2,8 +2,7 @@ package gosshgit
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +32,7 @@ var (
 	errAccessDenied      = errors.New("gosshgit: access denied")
 )
 
+// Server accepts connections and serves git repositories to allowed clients
 type Server interface {
 	// Initialize creates keys and configures the server
 	Initialize() error
@@ -60,12 +60,17 @@ type Server interface {
 	Allow(publickKey string)
 	// Disallow disables access for given public key
 	Disallow(publickKey string)
+
+	// PublicKey returns the ssh server public key
+	PublicKey() ssh.PublicKey
 }
 
 type server struct {
 	clientKeys    map[string]bool
 	repositoryDir string
 	sshConfig     *ssh.ServerConfig
+	privateKey    ed25519.PrivateKey
+	publicKey     ssh.PublicKey
 
 	listener     io.Closer
 	doneChan     chan struct{}
@@ -100,7 +105,11 @@ func (srv *server) Initialize() error {
 		},
 	}
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	publicKey, privateKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return err
+	}
+	sshPublicKey, err := ssh.NewPublicKey(publicKey)
 	if err != nil {
 		return err
 	}
@@ -109,6 +118,8 @@ func (srv *server) Initialize() error {
 		return err
 	}
 	srv.sshConfig.AddHostKey(privateSigner)
+	srv.privateKey = privateKey
+	srv.publicKey = sshPublicKey
 
 	return nil
 }
@@ -214,6 +225,10 @@ func (srv *server) ListenAndServe(address string) error {
 		return err
 	}
 	return srv.Serve(ln)
+}
+
+func (srv *server) PublicKey() ssh.PublicKey {
+	return srv.publicKey
 }
 
 func (srv *server) handleConnection(tcpConn net.Conn) {
