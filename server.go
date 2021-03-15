@@ -20,13 +20,16 @@ import (
 
 const (
 	// Version of the gosshgit server
-	Version = "0.1.0"
+	Version = "0.2.0"
 )
 
 var (
 	// ErrServerClosed signals the caller that the opration was requested
 	// to a closed server
 	ErrServerClosed = errors.New("gosshgit: server closed")
+
+	// ErrRepositoryAlreadyExists signals the caller that given repository name is taken
+	ErrRepositoryAlreadyExists = errors.New("gosshgit: repository already exists")
 
 	errInvalidGitCommand = errors.New("gosshgit: invalid git command")
 	errAccessDenied      = errors.New("gosshgit: access denied")
@@ -56,21 +59,22 @@ type Server interface {
 	// to handle incoming connections
 	ListenAndServe(address string) error
 
-	// Allow enables access for given public key
-	Allow(publickKey string)
+	// Allow enables access for given public key to given repository
+	Allow(publickKey string, repository string)
 	// Disallow disables access for given public key
-	Disallow(publickKey string)
+	Disallow(publickKey string, repository string)
 
 	// PublicKey returns the ssh server public key
 	PublicKey() ssh.PublicKey
 }
 
 type server struct {
-	clientKeys    map[string]bool
-	repositoryDir string
-	sshConfig     *ssh.ServerConfig
-	privateKey    ed25519.PrivateKey
-	publicKey     ssh.PublicKey
+	clientKeys       map[string]int
+	repositoryAccess map[string]map[string]bool
+	repositoryDir    string
+	sshConfig        *ssh.ServerConfig
+	privateKey       ed25519.PrivateKey
+	publicKey        ssh.PublicKey
 
 	listener     io.Closer
 	doneChan     chan struct{}
@@ -83,9 +87,10 @@ type server struct {
 // repositories to path provided
 func New(repositoryPath string) Server {
 	return &server{
-		clientKeys:    make(map[string]bool),
-		repositoryDir: repositoryPath,
-		sshConfig:     nil,
+		clientKeys:       make(map[string]int),
+		repositoryAccess: make(map[string]map[string]bool),
+		repositoryDir:    repositoryPath,
+		sshConfig:        nil,
 
 		doneChan:    make(chan struct{}),
 		connections: make(map[io.Closer]bool),
@@ -98,10 +103,15 @@ func (srv *server) Initialize() error {
 	srv.sshConfig = &ssh.ServerConfig{
 		ServerVersion: fmt.Sprintf("SSH-2.0-gosshgit %s", Version),
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if !srv.keyHasAccess(strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))) {
+			keyStr := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+			if !srv.keyHasAccess(keyStr) {
 				return nil, errAccessDenied
 			}
-			return &ssh.Permissions{}, nil
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"public-key": keyStr,
+				},
+			}, nil
 		},
 	}
 
@@ -159,6 +169,13 @@ func (srv *server) Close() error {
 }
 
 func (srv *server) InitBareRepo(name string) error {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	_, ok := srv.repositoryAccess[name]
+	if ok {
+		return ErrRepositoryAlreadyExists
+	}
+
 	fullPath := filepath.Join(srv.repositoryDir, name)
 	err := exec.Command("git", "init", "--bare", fullPath).Run()
 	if err != nil {
@@ -170,24 +187,37 @@ func (srv *server) InitBareRepo(name string) error {
 	if err != nil {
 		return err
 	}
+	srv.repositoryAccess[name] = make(map[string]bool)
 
 	return nil
 }
 
 // DeleteRepo will remove the repository permanently from the disk
 func (srv *server) DeleteRepo(name string) error {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	delete(srv.repositoryAccess, name)
 	fullPath := filepath.Join(srv.repositoryDir, name)
 	return exec.Command("rm", "-rf", fullPath).Run()
 }
 
 // Allow will grant access to all repositories for the given public key
-func (srv *server) Allow(publicKey string) {
-	srv.clientKeys[publicKey] = true
+func (srv *server) Allow(publicKey string, repository string) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.clientKeys[publicKey]++
+	srv.repositoryAccess[repository][publicKey] = true
 }
 
 // Disallow will remove access to all repositories from the given public key
-func (srv *server) Disallow(publicKey string) {
-	delete(srv.clientKeys, publicKey)
+func (srv *server) Disallow(publicKey string, repository string) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.clientKeys[publicKey]--
+	if srv.clientKeys[publicKey] == 0 {
+		delete(srv.clientKeys, publicKey)
+	}
+	delete(srv.repositoryAccess[repository], publicKey)
 }
 
 // Serve accepts incoming connections on the listener
@@ -254,12 +284,14 @@ func (srv *server) handleConnection(tcpConn net.Conn) {
 
 	go ssh.DiscardRequests(reqs)
 
+	clientPublicKey := sshConn.Permissions.Extensions["public-key"]
+
 	for newChannel := range chans {
-		go srv.handleChannel(newChannel)
+		go srv.handleChannel(newChannel, clientPublicKey)
 	}
 }
 
-func (srv *server) handleChannel(channel ssh.NewChannel) {
+func (srv *server) handleChannel(channel ssh.NewChannel, clientPublicKey string) {
 	if channel.ChannelType() != "session" {
 		log.Printf("gosshgit: unknown channel type '%v'", channel.ChannelType())
 		channel.Reject(ssh.UnknownChannelType, "unknown channel type")
@@ -297,8 +329,14 @@ func (srv *server) handleChannel(channel ssh.NewChannel) {
 
 			gitcmd, gitrepo, err := srv.parseCommand(payload.Value)
 			if err != nil {
-				log.Println("git-ssh: error parsing command:", err)
+				log.Println("gosshgit: error parsing command:", err)
 				connection.Write([]byte("Invalid command.\r\n"))
+				return
+			}
+
+			if !srv.hasRepositoryAccess(clientPublicKey, gitrepo) {
+				// no access
+				connection.Write([]byte("Access denied.\r\n"))
 				return
 			}
 
@@ -312,6 +350,11 @@ func (srv *server) handleChannel(channel ssh.NewChannel) {
 			return
 		}
 	}
+}
+func (srv *server) hasRepositoryAccess(clientPublicKey string, repository string) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return srv.repositoryAccess[repository][clientPublicKey]
 }
 
 func (srv *server) trackConnection(connection io.Closer, add bool) {
@@ -329,6 +372,8 @@ func (srv *server) trackConnection(connection io.Closer, add bool) {
 
 // keyHasAccess will check if the given public key has access to the git server
 func (srv *server) keyHasAccess(publicKey string) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 	if _, ok := srv.clientKeys[publicKey]; !ok {
 		return false
 	}
